@@ -3,6 +3,7 @@ extern crate termios;
 extern crate ioctl_rs as ioctl;
 
 use std::ffi::CString;
+use std::fmt;
 use std::io;
 use std::path::Path;
 use std::time::Duration;
@@ -272,6 +273,14 @@ impl<'a> io::Write for &'a TTYPort {
 
     fn flush(&mut self) -> io::Result<()> {
         termios::tcdrain(self.fd)
+    }
+}
+
+impl fmt::Debug for TTYPort {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        let mut builder = fmt.debug_struct("SerialPort");
+        builder.field("fd", &self.fd);
+        builder.finish()
     }
 }
 
