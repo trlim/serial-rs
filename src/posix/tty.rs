@@ -6,6 +6,7 @@ use std::ffi::CString;
 use std::io;
 use std::path::Path;
 use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use std::os::unix::prelude::*;
 
@@ -22,6 +23,45 @@ const O_NOCTTY: c_int = 0x00020000;
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 const O_NOCTTY: c_int = 0;
+
+#[doc(hidden)]
+pub trait IsMinusOne {
+    fn is_minus_one(&self) -> bool;
+}
+
+macro_rules! impl_is_minus_one {
+    ($($t:ident)*) => ($(impl IsMinusOne for $t {
+        fn is_minus_one(&self) -> bool {
+            *self == -1
+        }
+    })*)
+}
+
+impl_is_minus_one! { i8 i16 i32 i64 isize }
+
+pub fn cvt<T: IsMinusOne>(t: T) -> io::Result<T> {
+    if t.is_minus_one() {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(t)
+    }
+}
+
+#[cfg(not(any(target_env = "newlib", target_os = "solaris", target_os = "emscripten")))]
+fn set_cloexec(fd: RawFd) -> io::Result<()> {
+    unsafe {
+        try!(cvt(libc::ioctl(fd, libc::FIOCLEX)));
+        Ok(())
+    }
+}
+#[cfg(any(target_env = "newlib", target_os = "solaris", target_os = "emscripten"))]
+fn set_cloexec(fd: RawFd) -> io::Result<()> {
+    unsafe {
+        let previous = try!(cvt(libc::fcntl(fd, libc::F_GETFD)));
+        try!(cvt(libc::fcntl(fd, libc::F_SETFD, previous | libc::FD_CLOEXEC)));
+        Ok(())
+    }
+}
 
 
 /// A TTY-based serial port implementation.
@@ -103,6 +143,61 @@ impl TTYPort {
             Ok(pins) => Ok(pins & pin != 0),
             Err(err) => Err(super::error::from_io_error(err))
         }
+    }
+
+    pub fn duplicate(&self) -> io::Result<TTYPort> {
+        // We want to atomically duplicate this file descriptor and set the
+        // CLOEXEC flag, and currently that's done via F_DUPFD_CLOEXEC. This
+        // flag, however, isn't supported on older Linux kernels (earlier than
+        // 2.6.24).
+        //
+        // To detect this and ensure that CLOEXEC is still set, we
+        // follow a strategy similar to musl [1] where if passing
+        // F_DUPFD_CLOEXEC causes `fcntl` to return EINVAL it means it's not
+        // supported (the third parameter, 0, is always valid), so we stop
+        // trying that.
+        //
+        // Also note that Android doesn't have F_DUPFD_CLOEXEC, but get it to
+        // resolve so we at least compile this.
+        //
+        // [1]: http://comments.gmane.org/gmane.linux.lib.musl.general/2963
+        #[cfg(target_os = "android")]
+        use self::libc::F_DUPFD as F_DUPFD_CLOEXEC;
+        #[cfg(not(target_os = "android"))]
+        use self::libc::F_DUPFD_CLOEXEC;
+
+        let make_filedesc = |fd| {
+            try!(set_cloexec(fd));
+            Ok(TTYPort {
+                fd: fd,
+                timeout: self.timeout
+            })
+        };
+        static TRY_CLOEXEC: AtomicBool =
+            AtomicBool::new(!cfg!(target_os = "android"));
+        let fd = self.fd;
+        if TRY_CLOEXEC.load(Ordering::Relaxed) {
+            match cvt(unsafe { libc::fcntl(fd, F_DUPFD_CLOEXEC, 0) }) {
+                // We *still* call the `set_cloexec` method as apparently some
+                // linux kernel at some point stopped setting CLOEXEC even
+                // though it reported doing so on F_DUPFD_CLOEXEC.
+                Ok(fd) => {
+                    return Ok(if cfg!(target_os = "linux") {
+                        try!(make_filedesc(fd))
+                    } else {
+                        TTYPort {
+                            fd: fd,
+                            timeout: self.timeout
+                        }
+                    })
+                }
+                Err(ref e) if e.raw_os_error() == Some(libc::EINVAL) => {
+                    TRY_CLOEXEC.store(false, Ordering::Relaxed);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        cvt(unsafe { libc::fcntl(fd, libc::F_DUPFD, 0) }).and_then(make_filedesc)
     }
 }
 
