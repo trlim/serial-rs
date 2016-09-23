@@ -4,10 +4,10 @@ extern crate ioctl_rs as ioctl;
 
 use std::ffi::CString;
 use std::fmt;
+use std::fs::File;
 use std::io;
 use std::path::Path;
 use std::time::Duration;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use std::os::unix::prelude::*;
 
@@ -25,51 +25,12 @@ const O_NOCTTY: c_int = 0x00020000;
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 const O_NOCTTY: c_int = 0;
 
-#[doc(hidden)]
-pub trait IsMinusOne {
-    fn is_minus_one(&self) -> bool;
-}
-
-macro_rules! impl_is_minus_one {
-    ($($t:ident)*) => ($(impl IsMinusOne for $t {
-        fn is_minus_one(&self) -> bool {
-            *self == -1
-        }
-    })*)
-}
-
-impl_is_minus_one! { i8 i16 i32 i64 isize }
-
-pub fn cvt<T: IsMinusOne>(t: T) -> io::Result<T> {
-    if t.is_minus_one() {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(t)
-    }
-}
-
-#[cfg(not(any(target_env = "newlib", target_os = "solaris", target_os = "emscripten")))]
-fn set_cloexec(fd: RawFd) -> io::Result<()> {
-    unsafe {
-        try!(cvt(libc::ioctl(fd, libc::FIOCLEX)));
-        Ok(())
-    }
-}
-#[cfg(any(target_env = "newlib", target_os = "solaris", target_os = "emscripten"))]
-fn set_cloexec(fd: RawFd) -> io::Result<()> {
-    unsafe {
-        let previous = try!(cvt(libc::fcntl(fd, libc::F_GETFD)));
-        try!(cvt(libc::fcntl(fd, libc::F_SETFD, previous | libc::FD_CLOEXEC)));
-        Ok(())
-    }
-}
-
 
 /// A TTY-based serial port implementation.
 ///
 /// The port will be closed when the value is dropped.
 pub struct TTYPort {
-    fd: RawFd,
+    inner: File,
     timeout: Duration
 }
 
@@ -104,17 +65,17 @@ impl TTYPort {
         }
 
         let mut port = TTYPort {
-            fd: fd,
+            inner: unsafe { File::from_raw_fd(fd) },
             timeout: Duration::from_millis(100)
         };
 
         // get exclusive access to device
-        if let Err(err) = ioctl::tiocexcl(port.fd) {
+        if let Err(err) = ioctl::tiocexcl(fd) {
             return Err(super::error::from_io_error(err))
         }
 
         // clear O_NONBLOCK flag
-        if unsafe { libc::fcntl(port.fd, F_SETFL, 0) } < 0 {
+        if unsafe { libc::fcntl(fd, F_SETFL, 0) } < 0 {
             return Err(super::error::last_os_error());
         }
 
@@ -126,11 +87,13 @@ impl TTYPort {
     }
 
     fn set_pin(&mut self, pin: c_int, level: bool) -> ::Result<()> {
+        let fd = self.inner.as_raw_fd();
+
         let retval = if level {
-            ioctl::tiocmbis(self.fd, pin)
+            ioctl::tiocmbis(fd, pin)
         }
         else {
-            ioctl::tiocmbic(self.fd, pin)
+            ioctl::tiocmbic(fd, pin)
         };
 
         match retval {
@@ -140,88 +103,41 @@ impl TTYPort {
     }
 
     fn read_pin(&mut self, pin: c_int) -> ::Result<bool> {
-        match ioctl::tiocmget(self.fd) {
+        match ioctl::tiocmget(self.inner.as_raw_fd()) {
             Ok(pins) => Ok(pins & pin != 0),
             Err(err) => Err(super::error::from_io_error(err))
         }
     }
 
     pub fn duplicate(&self) -> io::Result<TTYPort> {
-        // We want to atomically duplicate this file descriptor and set the
-        // CLOEXEC flag, and currently that's done via F_DUPFD_CLOEXEC. This
-        // flag, however, isn't supported on older Linux kernels (earlier than
-        // 2.6.24).
-        //
-        // To detect this and ensure that CLOEXEC is still set, we
-        // follow a strategy similar to musl [1] where if passing
-        // F_DUPFD_CLOEXEC causes `fcntl` to return EINVAL it means it's not
-        // supported (the third parameter, 0, is always valid), so we stop
-        // trying that.
-        //
-        // Also note that Android doesn't have F_DUPFD_CLOEXEC, but get it to
-        // resolve so we at least compile this.
-        //
-        // [1]: http://comments.gmane.org/gmane.linux.lib.musl.general/2963
-        #[cfg(target_os = "android")]
-        use self::libc::F_DUPFD as F_DUPFD_CLOEXEC;
-        #[cfg(not(target_os = "android"))]
-        use self::libc::F_DUPFD_CLOEXEC;
-
-        let make_filedesc = |fd| {
-            try!(set_cloexec(fd));
-            Ok(TTYPort {
-                fd: fd,
-                timeout: self.timeout
-            })
-        };
-        static TRY_CLOEXEC: AtomicBool =
-            AtomicBool::new(!cfg!(target_os = "android"));
-        let fd = self.fd;
-        if TRY_CLOEXEC.load(Ordering::Relaxed) {
-            match cvt(unsafe { libc::fcntl(fd, F_DUPFD_CLOEXEC, 0) }) {
-                // We *still* call the `set_cloexec` method as apparently some
-                // linux kernel at some point stopped setting CLOEXEC even
-                // though it reported doing so on F_DUPFD_CLOEXEC.
-                Ok(fd) => {
-                    return Ok(if cfg!(target_os = "linux") {
-                        try!(make_filedesc(fd))
-                    } else {
-                        TTYPort {
-                            fd: fd,
-                            timeout: self.timeout
-                        }
-                    })
-                }
-                Err(ref e) if e.raw_os_error() == Some(libc::EINVAL) => {
-                    TRY_CLOEXEC.store(false, Ordering::Relaxed);
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        cvt(unsafe { libc::fcntl(fd, libc::F_DUPFD, 0) }).and_then(make_filedesc)
+        let file = try!(self.inner.try_clone());
+        Ok(TTYPort {
+            inner: file,
+            timeout: self.timeout
+        })
     }
 }
 
 impl Drop for TTYPort {
     fn drop(&mut self) {
         #![allow(unused_must_use)]
-        ioctl::tiocnxcl(self.fd);
+        ioctl::tiocnxcl(self.inner.as_raw_fd());
 
         unsafe {
-            libc::close(self.fd);
+            libc::close(self.inner.as_raw_fd());
         }
     }
 }
 
 impl AsRawFd for TTYPort {
     fn as_raw_fd(&self) -> RawFd {
-        self.fd
+        self.inner.as_raw_fd()
     }
 }
 
 impl io::Read for TTYPort {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        try!(super::poll::wait_read_fd(self.fd, self.timeout));
+        try!(super::poll::wait_read_fd(self.inner.as_raw_fd(), self.timeout));
 
         io::Read::read(&mut &*self, buf)
     }
@@ -229,7 +145,7 @@ impl io::Read for TTYPort {
 
 impl<'a> io::Read for &'a TTYPort {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let len = unsafe { libc::read(self.fd, buf.as_ptr() as *mut c_void, buf.len() as size_t) };
+        let len = unsafe { libc::read(self.inner.as_raw_fd(), buf.as_ptr() as *mut c_void, buf.len() as size_t) };
 
         if len >= 0 {
             Ok(len as usize)
@@ -242,9 +158,11 @@ impl<'a> io::Read for &'a TTYPort {
 
 impl io::Write for TTYPort {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        try!(super::poll::wait_write_fd(self.fd, self.timeout));
+        let fd = self.inner.as_raw_fd();
 
-        let len = unsafe { libc::write(self.fd, buf.as_ptr() as *mut c_void, buf.len() as size_t) };
+        try!(super::poll::wait_write_fd(fd, self.timeout));
+
+        let len = unsafe { libc::write(fd, buf.as_ptr() as *mut c_void, buf.len() as size_t) };
 
         if len >= 0 {
             Ok(len as usize)
@@ -261,7 +179,7 @@ impl io::Write for TTYPort {
 
 impl<'a> io::Write for &'a TTYPort {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let len = unsafe { libc::write(self.fd, buf.as_ptr() as *mut c_void, buf.len() as size_t) };
+        let len = unsafe { libc::write(self.inner.as_raw_fd(), buf.as_ptr() as *mut c_void, buf.len() as size_t) };
 
         if len >= 0 {
             Ok(len as usize)
@@ -272,14 +190,14 @@ impl<'a> io::Write for &'a TTYPort {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        termios::tcdrain(self.fd)
+        termios::tcdrain(self.inner.as_raw_fd())
     }
 }
 
 impl fmt::Debug for TTYPort {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         let mut builder = fmt.debug_struct("SerialPort");
-        builder.field("fd", &self.fd);
+        builder.field("fd", &self.inner.as_raw_fd());
         builder.finish()
     }
 }
@@ -294,7 +212,7 @@ impl SerialDevice for TTYPort {
         use self::termios::{INLCR,IGNCR,ICRNL,IGNBRK}; // iflags
         use self::termios::{VMIN,VTIME}; // c_cc indexes
 
-        let mut termios = match termios::Termios::from_fd(self.fd) {
+        let mut termios = match termios::Termios::from_fd(self.inner.as_raw_fd()) {
             Ok(t) => t,
             Err(e) => return Err(super::error::from_io_error(e))
         };
@@ -315,12 +233,14 @@ impl SerialDevice for TTYPort {
         use self::termios::{tcsetattr,tcflush};
         use self::termios::{TCSANOW,TCIOFLUSH};
 
+        let fd = self.inner.as_raw_fd();
+
         // write settings to TTY
-        if let Err(err) = tcsetattr(self.fd, TCSANOW, &settings.termios) {
+        if let Err(err) = tcsetattr(fd, TCSANOW, &settings.termios) {
             return Err(super::error::from_io_error(err));
         }
 
-        if let Err(err) = tcflush(self.fd, TCIOFLUSH) {
+        if let Err(err) = tcflush(fd, TCIOFLUSH) {
             return Err(super::error::from_io_error(err));
         }
 

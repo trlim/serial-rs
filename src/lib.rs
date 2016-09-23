@@ -1,5 +1,3 @@
-#![feature(const_fn)]
-
 use std::default::Default;
 use std::error::Error as StdError;
 use std::ffi::OsStr;
