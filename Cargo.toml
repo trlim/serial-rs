@@ -21,11 +21,23 @@ ioctl-rs = "0.1.5"
 termios = "0.2.2"
 ioctl-rs = "0.1.5"
 
+[target.arm-unknown-linux-musleabi.dependencies]
+termios = "0.2.2"
+ioctl-rs = "0.1.5"
+
 [target.arm-unknown-linux-gnueabihf.dependencies]
 termios = "0.2.2"
 ioctl-rs = "0.1.5"
 
+[target.arm-unknown-linux-musleabihf.dependencies]
+termios = "0.2.2"
+ioctl-rs = "0.1.5"
+
 [target.armv7-unknown-linux-gnueabihf.dependencies]
+termios = "0.2.2"
+ioctl-rs = "0.1.5"
+
+[target.armv7-unknown-linux-musleabihf.dependencies]
 termios = "0.2.2"
 ioctl-rs = "0.1.5"
 
@@ -34,6 +46,10 @@ termios = "0.2.2"
 ioctl-rs = "0.1.5"
 
 [target.i686-unknown-linux-gnu.dependencies]
+termios = "0.2.2"
+ioctl-rs = "0.1.5"
+
+[target.i686-unknown-linux-musl.dependencies]
 termios = "0.2.2"
 ioctl-rs = "0.1.5"
 
@@ -62,6 +78,10 @@ termios = "0.2.2"
 ioctl-rs = "0.1.5"
 
 [target.x86_64-unknown-linux-gnu.dependencies]
+termios = "0.2.2"
+ioctl-rs = "0.1.5"
+
+[target.x86_64-unknown-linux-musl.dependencies]
 termios = "0.2.2"
 ioctl-rs = "0.1.5"
 
